@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Haryana Roadways Live Tracker</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; background: #eef3f8; color: #0f172a; }
+    .app { max-width: 460px; margin: 0 auto; min-height: 100vh; background: #ffffff; box-shadow: 0 0 0 1px #dbe3ed; }
+    .topbar { background: #005ea8; color: #fff; padding: 0.7rem 0.9rem; font-weight: 700; }
+    .controls { padding: 0.8rem; border-bottom: 1px solid #e2e8f0; }
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; }
+    label { font-size: 0.74rem; color: #475569; display: block; margin-bottom: 0.25rem; }
+    input, button { width: 100%; padding: 0.58rem; border-radius: 8px; border: 1px solid #cbd5e1; margin-bottom: 0.55rem; }
+    button { border: 0; background: #15803d; color: #fff; font-weight: 600; cursor: pointer; }
+    button.alt { background: #0f766e; }
+    button:hover { opacity: 0.92; }
+    .status-banner { padding: 0.6rem 0.8rem; background: #b91c1c; color: #fff; font-weight: 600; font-size: 0.85rem; display: none; }
+    .status-banner.ok { background: #166534; }
+    .summary { padding: 0.75rem 0.85rem; border-bottom: 1px solid #e2e8f0; font-size: 0.88rem; }
+    .timeline-wrap { padding: 0.6rem 0.8rem 1rem; }
+    .timeline-item { display: grid; grid-template-columns: 72px 28px 1fr; gap: 0.5rem; align-items: start; margin-bottom: 0.35rem; }
+    .t-time { font-weight: 700; font-size: 0.88rem; text-align: right; padding-top: 0.15rem; }
+    .t-line { position: relative; min-height: 46px; }
+    .t-dot { width: 10px; height: 10px; border-radius: 50%; background: #0ea5e9; margin: 0 auto; position: relative; z-index: 1; }
+    .t-line::after { content: ""; position: absolute; left: 50%; top: 10px; width: 2px; height: calc(100% - 2px); background: #bae6fd; transform: translateX(-50%); }
+    .t-card { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 0.45rem 0.55rem; font-size: 0.84rem; }
+    .muted { color: #64748b; font-size: 0.75rem; }
+    #map { height: 220px; border-top: 1px solid #e2e8f0; border-bottom: 1px solid #e2e8f0; }
+    .footerbox { padding: 0.6rem 0.8rem 1rem; }
+    pre { white-space: pre-wrap; font-size: 0.66rem; background: #0f172a; color: #e2e8f0; border-radius: 8px; padding: 0.6rem; max-height: 120px; overflow: auto; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="topbar">Haryana Roadways - Journey Tracker</div>
+    <div class="controls">
+      <label>API Base URL</label>
+      <input id="apiBase" value="http://127.0.0.1:8000" />
+      <div class="grid2">
+        <div>
+          <label>From</label>
+          <input id="fromStop" value="Chandigarh" />
+        </div>
+        <div>
+          <label>To</label>
+          <input id="toStop" value="Delhi" />
+        </div>
+      </div>
+      <button id="btnPlan" type="button">Find Buses</button>
+      <div class="grid2">
+        <div>
+          <label>Bus ID</label>
+          <input id="busId" type="number" value="1" />
+        </div>
+        <div>
+          <label>&nbsp;</label>
+          <button id="btnWs" class="alt" type="button">Start Live</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="statusBanner" class="status-banner">Loading live status...</div>
+    <div id="summary" class="summary">Search route to view expected time, distance and stops.</div>
+    <div id="map"></div>
+    <div class="timeline-wrap" id="timeline"></div>
+    <div class="footerbox">
+      <button id="btnPoll" class="alt" type="button">Refresh Now</button>
+      <pre id="liveJson"></pre>
+      <div class="muted">Tip: run simulator in terminal for cellular-like live updates.</div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const apiBaseEl = document.getElementById("apiBase");
+    const map = L.map("map").setView([29.4, 76.9], 8);
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19 }).addTo(map);
+    let liveMarker = null;
+    let ws = null;
+
+    const routeLayer = L.layerGroup().addTo(map);
+    let selectedPlan = null;
+
+    function getBase() {
+      return apiBaseEl.value.replace(/\/$/, "");
+    }
+
+    async function api(path, opts = {}) {
+      const r = await fetch(getBase() + path, opts);
+      if (!r.ok) throw new Error(await r.text());
+      return r.json();
+    }
+
+    function drawStopsOnMap(stops) {
+      routeLayer.clearLayers();
+      const points = stops.map(s => [s.lat, s.lng]);
+      if (points.length) {
+        L.polyline(points, { color: "#0ea5e9", weight: 4 }).addTo(routeLayer);
+        points.forEach((pt, idx) => {
+          L.circleMarker(pt, { radius: 5, color: "#1d4ed8" }).addTo(routeLayer).bindPopup(stops[idx].name);
+        });
+        map.fitBounds(points, { padding: [20, 20] });
+      }
+    }
+
+    function updateStatusBanner(delayMin, etaMin) {
+      const el = document.getElementById("statusBanner");
+      if (delayMin > 0) {
+        el.className = "status-banner";
+        el.style.display = "block";
+        el.textContent = `Bus delayed by ${delayMin} min. Estimated arrival: ${etaMin ?? "-"} min`;
+      } else {
+        el.className = "status-banner ok";
+        el.style.display = "block";
+        el.textContent = `Bus is on time. Estimated arrival: ${etaMin ?? "-"} min`;
+      }
+    }
+
+    function renderTimeline(stops, expectedTotalMin) {
+      const timeline = document.getElementById("timeline");
+      timeline.innerHTML = "";
+      if (!stops?.length) return;
+      const start = new Date();
+      const step = stops.length > 1 ? Math.max(5, Math.round(expectedTotalMin / (stops.length - 1))) : 0;
+      stops.forEach((s, idx) => {
+        const t = new Date(start.getTime() + idx * step * 60000);
+        const hh = String(t.getHours()).padStart(2, "0");
+        const mm = String(t.getMinutes()).padStart(2, "0");
+        const item = document.createElement("div");
+        item.className = "timeline-item";
+        item.innerHTML = `
+          <div class="t-time">${hh}:${mm}</div>
+          <div class="t-line"><div class="t-dot"></div></div>
+          <div class="t-card"><strong>${s.name}</strong><div class="muted">${s.code} • ${idx === 0 ? "Start" : idx === stops.length - 1 ? "Destination" : "Stop " + idx}</div></div>
+        `;
+        timeline.appendChild(item);
+      });
+    }
+
+    document.getElementById("btnPlan").onclick = async () => {
+      const fromStop = document.getElementById("fromStop").value.trim();
+      const toStop = document.getElementById("toStop").value.trim();
+      const body = JSON.stringify({ from_stop: fromStop, to_stop: toStop });
+      const data = await api("/routes/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+      });
+
+      if (!data.matches || !data.matches.length) {
+        document.getElementById("summary").textContent = "No direct route found for entered stops.";
+        document.getElementById("timeline").innerHTML = "";
+        return;
+      }
+      selectedPlan = data.matches[0];
+      drawStopsOnMap(selectedPlan.stops_between);
+      renderTimeline(selectedPlan.stops_between, selectedPlan.expected_time_min);
+      const eta = selectedPlan.nearest_bus_eta_min === null ? "N/A" : `${selectedPlan.nearest_bus_eta_min} min`;
+      document.getElementById("summary").innerHTML =
+        `<strong>${selectedPlan.route.code}</strong> • ${selectedPlan.route.name}<br>` +
+        `Distance ${selectedPlan.distance_km} km • Expected ${selectedPlan.expected_time_min} min • Next bus ETA ${eta}`;
+      updateStatusBanner(selectedPlan.live_delay_min, selectedPlan.nearest_bus_eta_min);
+    };
+
+    function plotLive(busId, data) {
+      document.getElementById("liveJson").textContent = JSON.stringify(data, null, 2);
+      if (liveMarker) liveMarker.setLatLng([data.lat, data.lng]);
+      else liveMarker = L.marker([data.lat, data.lng]).addTo(map).bindPopup(`Bus ${busId}`).openPopup();
+      map.panTo([data.lat, data.lng]);
+      updateStatusBanner(data.delay_minutes || 0, null);
+    }
+
+    document.getElementById("btnPoll").onclick = async () => {
+      const busId = document.getElementById("busId").value;
+      const data = await api(`/buses/${busId}/live`);
+      plotLive(busId, data);
+    };
+
+    document.getElementById("btnWs").onclick = () => {
+      const busId = document.getElementById("busId").value;
+      if (ws) ws.close();
+      const wsBase = getBase().replace("http://", "ws://").replace("https://", "wss://");
+      ws = new WebSocket(`${wsBase}/ws/buses/${busId}/live`);
+      ws.onopen = () => document.getElementById("btnWs").textContent = "Streaming...";
+      ws.onmessage = (event) => plotLive(busId, JSON.parse(event.data));
+      ws.onclose = () => document.getElementById("btnWs").textContent = "Start Live Stream";
+    };
+  </script>
+</body>
+</html>
